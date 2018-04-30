@@ -472,7 +472,7 @@ establish_remote(struct file *file, ocpi_request_t *request) {
   bool found = false, bad = false;
   ocpi_address_t end_address = phys + request->actual;
   ocpi_block_t *block = NULL;
-  unsigned minor = iminor(file->f_dentry->d_inode);
+  unsigned minor = iminor(file->f_path.dentry->d_inode);
 
   log_debug("Establishing remote from bus 0x%llx to phys 0x%llx size %x\n",
 	    request->bus_addr, phys, request->actual);
@@ -551,7 +551,7 @@ request_memory(struct file *file, ocpi_request_t *request) {
   unsigned minor = 0;
 
   if (file != NULL)
-    minor = iminor(file->f_dentry->d_inode);
+    minor = iminor(file->f_path.dentry->d_inode);
   request->actual = PAGE_ALIGN(request->needed);
   log_debug("memory request file %p %lx -> %lx\n",
 	    file, (unsigned long)request->needed, (unsigned long)request->actual);
@@ -678,15 +678,26 @@ static struct vm_operations_struct opencpi_vm_ops = {
   .nopage = opencpi_vma_nopage,
 };
 #else
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
 static int
 opencpi_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf) {
-  ocpi_block_t *block = vma->vm_private_data;
+#else
+// mm, fs: reduce fault, page_mkwrite, and pfn_mkwrite to take only vmf, 11bac80, v4.11-rc1
+static int
+opencpi_vma_fault(struct vm_fault *vmf) {
+#endif
+  ocpi_block_t *block = vmf->vma->vm_private_data;
 
   if (block && block->type == ocpi_kernel) {
     unsigned long offset = vmf->pgoff << PAGE_SHIFT;
     struct page *pageptr = virt_to_page(offset);
 
-    log_debug("vma_fault vma %p addr %p pfn %lx\n", vma, vmf->virtual_address, vmf->pgoff);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
+    log_debug("vma_fault vma %p addr %p pfn %lx\n", vmf->vma, vmf->virtual_address, vmf->pgoff);
+#else
+    // mm: join struct fault_env and vm_fault, 82b0f8c, v4.10.0
+    log_debug("vma_fault vma %p addr %p pfn %lx\n", vmf->vma, vmf->address, vmf->pgoff);
+#endif
     log_debug_block(block, "vma_fault:");
 
     get_page(pageptr);
@@ -766,7 +777,7 @@ static
 #ifdef HAVE_UNLOCKED_IOCTL
 long
 opencpi_io_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-  unsigned minor = iminor(file->f_dentry->d_inode);
+  unsigned minor = iminor(file->f_path.dentry->d_inode);
 #else
 int
 opencpi_io_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg) {
@@ -846,12 +857,12 @@ static int
 opencpi_io_mmap(struct file * file, struct vm_area_struct * vma) {
 #if 0
   unsigned minor;
-  log_debug("mmap: file %p, f_dentry %p inode %p vma %p\n",
-	    file, file->f_dentry, file->f_dentry->d_inode, vma);
-  minor = iminor(file->f_dentry->d_inode);
+  log_debug("mmap: file %p, f_path.dentry %p inode %p vma %p\n",
+	    file, file->f_path.dentry, file->f_path.dentry->d_inode, vma);
+  minor = iminor(file->f_path.dentry->d_inode);
   log_debug("mmap: minor: %u\n", minor);
 #else
-  unsigned minor = iminor(file->f_dentry->d_inode);
+  unsigned minor = iminor(file->f_path.dentry->d_inode);
   ocpi_device_t *mydev = opencpi_devices[minor];
   ocpi_size_t size = vma->vm_end - vma->vm_start;
   ocpi_address_t
@@ -1270,7 +1281,11 @@ net_create(struct socket *sock, int protocol) {
   struct sock *sk;
   if (sock->type != SOCK_DGRAM)
     return -ESOCKTNOSUPPORT;
-#ifdef OCPI_RH6
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)
+  // net: Pass kern from net_proto_family.create to sk_alloc, 11aa9c2, v4.2-rc1
+  if ((sk = sk_alloc(net, PF_OPENCPI, GFP_KERNEL, &opencpi_proto, kern)) == NULL)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 24)
+  // [NET]: Make socket creation namespace safe, 1b8d7ae, v2.6.24-rc1
   if ((sk = sk_alloc(net, PF_OPENCPI, GFP_KERNEL, &opencpi_proto)) == NULL)
 #else
   if ((sk = sk_alloc(PF_OPENCPI, GFP_KERNEL, &opencpi_proto, 1)) == NULL)
@@ -1355,7 +1370,12 @@ net_release(struct socket *sock) {
     write_unlock_bh(&opencpi_sklist_lock);
     skb_queue_purge(&sk->sk_receive_queue);
     release_sock(sk);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+    // net: convert sock.sk_refcnt from atomic_t to refcount_t, 41c6d65, v4.13-rc1
+    log_debug("socket %p count %d\n", sock, refcount_read(&sk->sk_refcnt));
+#else
     log_debug("socket %p count %d\n", sock, atomic_read(&sk->sk_refcnt));
+#endif
     sock_put(sk); // decrement ref count from sock_init_data
   }
   return 0;
@@ -1460,15 +1480,26 @@ net_receive_dp(struct sk_buff *skb, struct net_device *dev, struct packet_type *
   return NET_RX_DROP;
 }
 static int
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+//net: Remove iocb argument from sendmsg and recvmsg, 1b78414, v4.1-rc1
+net_recvmsg(struct socket *sock, struct msghdr *msg, size_t total_len, int flags)
+#else
 net_recvmsg(struct kiocb *iocb, struct socket *sock,
-	    struct msghdr *msg, size_t total_len, int flags)
+  struct msghdr *msg, size_t total_len, int flags)
+#endif
 {
   int error = 0;
   struct sk_buff *skb =
     skb_recv_datagram(sock->sk, flags & ~MSG_DONTWAIT, flags & MSG_DONTWAIT, &error);
   if (skb != NULL) {
     total_len = min_t(size_t, total_len, skb->len);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+    struct iov_iter to;
+    iov_iter_init(&to, READ, msg->msg_iter.iov, 1, total_len);
+    error = skb_copy_datagram_iter(skb, 0, &to, total_len);
+#else
     error = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, total_len);
+#endif
     if (error == 0) {
       msg->msg_namelen = sizeof(ocpi_sockaddr_t);
       if (msg->msg_name)
@@ -1483,7 +1514,12 @@ net_recvmsg(struct kiocb *iocb, struct socket *sock,
 // our sockets our bound to an interface except for data,
 // which is dynamic
 static int
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+//net: Remove iocb argument from sendmsg and recvmsg, 1b78414, v4.1-rc1
+net_sendmsg(struct socket *sock, struct msghdr *msg, size_t total_len) {
+#else
 net_sendmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg, size_t total_len) {
+#endif
   struct sock *sk = sock->sk;
   struct net_device *dev = get_ocpi_sk(sk)->netdev;
   ocpi_sockaddr_t *mysa = &get_ocpi_sk(sk)->sockaddr;
@@ -1513,7 +1549,12 @@ net_sendmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg, size_t 
     skb->priority = sk->sk_priority;
     skb->protocol = etype;
     data = skb_put(skb, actual_len);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+    // put iov_iter into msghdr, c0371da, v3.19-rc1
+    if ((error = copy_from_iter(data, actual_len, &msg->msg_iter)) < 0)
+#else
     if ((error = memcpy_fromiovecend(data, msg->msg_iov, sizeof(uint16_t), actual_len)) < 0)
+#endif
       kfree_skb(skb);
     else {
       error = total_len;
