@@ -678,13 +678,12 @@ static struct vm_operations_struct opencpi_vm_ops = {
   .nopage = opencpi_vma_nopage,
 };
 #else
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
 static int
-opencpi_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf) {
-#else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 // mm, fs: reduce fault, page_mkwrite, and pfn_mkwrite to take only vmf, 11bac80, v4.11-rc1
-static int
 opencpi_vma_fault(struct vm_fault *vmf) {
+#else
+opencpi_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf) {
 #endif
   ocpi_block_t *block = vmf->vma->vm_private_data;
 
@@ -692,11 +691,11 @@ opencpi_vma_fault(struct vm_fault *vmf) {
     unsigned long offset = vmf->pgoff << PAGE_SHIFT;
     struct page *pageptr = virt_to_page(offset);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
-    log_debug("vma_fault vma %p addr %p pfn %lx\n", vmf->vma, vmf->virtual_address, vmf->pgoff);
-#else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
     // mm: join struct fault_env and vm_fault, 82b0f8c, v4.10.0
     log_debug("vma_fault vma %p addr %p pfn %lx\n", vmf->vma, vmf->address, vmf->pgoff);
+#else
+    log_debug("vma_fault vma %p addr %p pfn %lx\n", vmf->vma, vmf->virtual_address, vmf->pgoff);
 #endif
     log_debug_block(block, "vma_fault:");
 
